@@ -2,7 +2,19 @@
 
 **Design specification · September 25, 2026**
 
-This document defines a complete initial implementation contract for a coding-agent platform. It consolidates the orb and harness designs into one specification. The design has been reviewed; implementation, fault injection, security enforcement, and performance measurements remain to be demonstrated.
+This document is the invariant and protocol contract for a coding-agent platform. It consolidates the orb and harness designs into one specification. It fixes records, state transitions, and failure outcomes; it does not select vendors. A reference-stack companion must name the database, object store, sandbox backend, model backend, and repository connector, with the capability checks in this document applied to each, before Increment 1 begins. The design has been reviewed by model-driven reviewers only; implementation, fault injection, security enforcement, and performance measurements remain to be demonstrated.
+
+Terms used with one meaning throughout:
+
+| Term | Meaning |
+|---|---|
+| Proposal | A structured model response (`candidate_ready`, `input_needed`, `blocked`) that ends a turn without tool calls |
+| Handoff | The durable record created when a proposal or controller condition is consumed; kinds are `candidate`, `question`, `blocker` |
+| Source candidate | Immutable identity of the proposed repository contents captured from a continuation |
+| Integration candidate | Immutable identity of the source candidate applied to a recorded destination revision |
+| Acceptance | A reviewer or policy decision about one exact candidate under one task revision |
+| Authorization | Permission to perform one specific act: an authoring lease, a call, a publication dispatch |
+| Instruction | A durable user message; kinds are `answer`, `note`, `redirect` |
 
 **A task owns its work. A machine executes it.**
 
@@ -24,13 +36,13 @@ Persistent preview services, recovery of service memory or mutable database cont
 
 | ID | Required property |
 |---|---|
-| I1 | At most one authoring attempt has current authority to advance a task. Old attempts cannot regain authority by reconnecting. |
-| I2 | An acknowledged continuation can be restored without the original worker’s disk. Its conversation cursor and file checkpoint describe the same completed work. |
-| I3 | No action executes from an incomplete model response or an unconfirmed call-intent record. |
-| I4 | Required verification evidence, review acceptance, and publication authorization identify exact candidate contents and the applicable task revision. |
-| I5 | Every supported external mutation has a durable operation identity and an honest outcome. An unknown outcome is never silently converted into failure or success. |
-| I6 | Parallel tasks own separate writable state. Publication checks the destination version before changing shared state. |
-| I7 | Spending reservations remain allocated while a billable execution can still incur charges. A retry or replacement does not create free capacity. |
+| I1 | At most one attempt per task holds an unexpired authoring lease for the task’s current epoch. Every continuation commit, handoff, and dispatch authorization is a conditional transaction on that `(task, revision, epoch)`; any other epoch is rejected. Old attempts cannot regain authority by reconnecting. |
+| I2 | Within the configured storage durability contract, an acknowledged continuation restores byte-for-byte without the original worker’s disk: the same checkpoint manifest hash, conversation cursor, accepted-turn and call states, and environment identity. Its conversation cursor and file checkpoint describe the same completed work. |
+| I3 | No command process starts unless a complete accepted-turn record and a committed call-intent record for that call precede the supervisor’s start event. |
+| I4 | Required verification evidence, review acceptance, and publication authorization each name an exact candidate hash, task revision, verification-profile version, and environment identity, and are valid only while all four match in one conditional transaction. |
+| I5 | Every external mutation attempt ends in exactly one durable state: `not_dispatched`, `succeeded` with a destination receipt, `failed` with an authoritative destination response, or `outcome_unknown`. No retry is issued from `outcome_unknown` until reconciliation moves it to `succeeded` or `failed`. |
+| I6 | One task cannot read or write another task’s workspace, scratch, cache, or object namespace. Publication is a compare-and-swap on the expected destination revision, not a prior read followed by a write. |
+| I7 | Every billable execution holds a reservation from admission until provider-confirmed termination and settlement. Available capacity always subtracts every unsettled reservation, including those of replaced, deleted, and uncancelled executions. |
 
 These are implementation requirements. The validation plan below defines how to exercise them.
 
@@ -70,35 +82,84 @@ flowchart TD
 
 | Record | Required contents |
 |---|---|
-| Task | Owner, repository, immutable task revisions, current revision, finish condition, requested state, workflow phase, authority policy, and budget account |
-| Attempt | Task revision, increasing execution epoch, lease expiry, observed process state, and current continuation reference |
+| Task | Owner, repository, immutable task revisions, current revision, finish condition, requested state, workflow phase, current epoch, current continuation reference, active handoff reference, authority policy, and budget account |
+| Attempt | Task revision, execution epoch, lease expiry, observed process state, assigned workspace identity |
 | Continuation | File-checkpoint reference, environment version, committed conversation cursor, pending accepted turn, next call index, and version |
-| Checkpoint | Immutable manifest of repository files and their contents; declared exclusions; provenance and snapshot sequence |
+| Checkpoint | Content-addressed manifest hash; entries of canonical relative path, mode class, and blob hash or symlink target; declared exclusions; provenance and snapshot sequence |
+| Model request | Controller request ID, request slot, task revision, epoch, provider idempotency key, dispatch state, provider request identity when returned, reservation reference |
 | Accepted turn | Controller turn ID, model-request slot, complete response, ordered calls, required backend continuation metadata, and consumption state |
-| Call | Stable controller call ID, turn and ordinal, immutable arguments, execution tries, status, and observation reference |
-| Candidate | Immutable source or build-artifact identity, task revision, base revision, environment identity, verification-profile version, and provenance |
-| Verification evidence | Candidate identity, profile version, environment, observations, limits, and verification-controller identity |
+| Call | Stable controller call ID, turn and ordinal, immutable arguments, status, execution tries, and observation reference |
+| Observation | Observation ID, kind, task revision, epoch, producing call or controller event, exit status where applicable, bounded excerpt, artifact references, and terminality |
+| Handoff | Handoff ID keyed by consuming turn, kind, task revision, source-candidate reference or question text or blocker reason, and resolution state |
+| Instruction | Instruction ID, author, kind, text, task revision it was recorded under, and the handoff it resolves if any |
+| Wake request | Wake ID, task, task revision, cause, creation transaction, and claim state |
+| Candidate | Immutable source or build-artifact identity, kind (`source` or `integration`), task revision, base revision, environment identity, verification-profile version, dependency-closure hash, and provenance |
+| Verification evidence | Candidate identity, profile version, environment, dependency-closure hash actually used, observations, limits, and verification-controller identity |
 | Acceptance | Exact candidate identity, task revision, applicable evidence, accepting actor or policy, and decision |
-| External operation | Stable operation ID, immutable arguments and hash, candidate and task references, destination, expected destination version, authority basis, dispatch state, and receipt |
+| External operation | Stable operation ID, immutable arguments and hash, candidate and task references, destination, expected destination version, authority basis, dispatch attempts, and receipt |
 | Spending entry | Logical work reference, distinct billable-execution identity, reservation, observed usage, settlement, and any unresolved amount |
+
+Enumerated statuses. Each transition below is a conditional write; no other transitions exist.
+
+| Field | Values and legal transitions |
+|---|---|
+| Requested state | `active ⇄ paused`; `active → cancelled`; `paused → cancelled`. `cancelled` is terminal. |
+| Observed process state | `starting → running → draining → stopped`; any state `→ lost`. Written only by the control application from supervisor heartbeats and backend termination confirmations. |
+| Model request dispatch state | `registered → sent → accepted`; `sent → failed`; `sent → outcome_unknown`; `outcome_unknown → accepted` or `→ failed` only through provider lookup. |
+| Turn consumption | `pending → consumed`. |
+| Call status | `accepted → confirmed → executing → observed`; `accepted → error` (malformed or unsupported, never executed); `accepted → not_executed` with a reason (`superseded`, `denied`); `executing → interrupted`. `observed`, `error`, `not_executed`, and `interrupted` are terminal. |
+| Handoff resolution | `open → resolved` by exactly one transition-table row: completion, a callback returning the task to `work`, an instruction of kind `answer` or `redirect`, or explicit user resolution of a blocker. A `candidate` handoff stays open through `verification`, `review`, and `publication`; the Task’s active handoff reference points at it. |
+| Wake claim | `pending → claimed → granted` or `→ ineligible`. Claiming is the lease-grant transaction. |
+| Operation dispatch attempt | `authorized → sent → succeeded` or `→ failed` or `→ outcome_unknown`; `outcome_unknown → succeeded` or `→ failed` only through a supported destination read. |
 
 A task revision binds the instructions, finish condition, base-environment identity, required verification-profile version, and task-specific authority policy. Changing any of these creates a new revision and invalidates pending decisions bound to the old one. Updating a shared profile template does not silently alter existing tasks; applying that update creates a task revision. Live credential or access revocation takes effect immediately regardless of revision.
 
-The continuation is the sole authoritative recovery reference. A newer file snapshot or log entry cannot independently replace it. Files and observations may be uploaded before a commit, but remain provisional until the database publishes their references together.
+The Task record’s current continuation reference is the sole authoritative recovery reference. A replacement attempt reads it from the Task in the lease-grant transaction; Attempts do not carry their own copy. A newer file snapshot or log entry cannot independently replace it. Files and observations may be uploaded before a commit, but remain provisional until the database publishes their references together.
 
-Use conditional database transactions to check the current task revision, attempt epoch, permitted task state, and expected prior continuation. Reject late uploads that would move progress backward. Store the state transition and its audit event in the same transaction.
+Use conditional database transactions to check the current task revision, current epoch, permitted task state, and expected prior continuation. Object ingestion itself is not fenced: any worker may upload blobs. Only the continuation commit is fenced, so a late commit from an older epoch fails regardless of its snapshot sequence. Store the state transition and its audit event in the same transaction.
 
 Object uploads use narrow credentials or a trusted proxy. Workers cannot overwrite immutable artifacts or declare their own upload authoritative. Garbage collection protects active uploads, pending publications, retained continuations, candidates, and accepted results before reclaiming unreferenced objects.
+
+A checkpoint is a content-addressed manifest. Each entry records a canonical relative path, a mode class (`file`, `executable`, `symlink`, `directory`), and either a blob hash or a symlink target string. Blobs are deduplicated in object storage by hash. The manifest hash is the checkpoint identity. The snapshotter reuses the previous manifest’s hashes for entries whose size and modification time are unchanged, so the cost of a checkpoint is proportional to changed bytes plus one directory walk. The workload measurements below set the accepted bound for that walk; less frequent checkpointing is permitted only if it preserves the paired-commit invariant.
+
+Snapshot and restore reject entries whose canonical path escapes the workspace root, device nodes, sockets, and FIFOs. Symlinks are recorded as targets and never followed during snapshot; hard links are recorded as independent entries. Ownership, setuid, and setgid bits are not recorded. Restore writes only beneath the fresh workspace root, refuses to follow an existing symlink when writing, and verifies every blob hash before the continuation is exposed to the model.
+
+A continuation commit is acknowledged only after object storage confirms durable persistence of the manifest and every referenced blob under the configured durability contract. I2 holds within that contract. A referenced object missing or corrupt on restore is a fault outside the contract; it is reported as a visible recovery failure, never repaired by pairing older files with newer history.
 
 **Keep requested state separate from workflow phase.**
 
 Requested state is `active`, `paused`, or `cancelled`. Workflow phase is `work`, `verification`, `review`, `input`, `blocked`, `publication`, or `complete`. Observed process state records whether a worker is starting, running, draining, stopped, or lost.
 
-Grant an authoring lease only when the task is active, its phase is work, no current authoring lease exists, and sufficient spending has been reserved. Grant a new increasing epoch in the same transaction. Renewals check the same authority using the database’s time.
+The following table is the complete set of workflow-phase transitions. A transition not listed here does not exist. Every row is one conditional transaction on the current task revision and, where a worker is involved, the current epoch. Rows marked *wake* create a Wake request in the same transaction. Rows marked *revision* create a new task revision in the same transaction.
 
-A lease is temporary permission to advance authoritative state. It does not physically stop a process. Check its epoch and validity at every publication and dispatch boundary. A supervisor also enforces expiration and stops the affected execution boundary. If exclusive ownership of an old workspace cannot be established, a replacement receives a different workspace.
+| From | Event | To | Effects |
+|---|---|---|---|
+| — | Task admitted | `work` | wake |
+| `work` | Turn consumed with `candidate_ready` | `verification` | Handoff `candidate` opened; source candidate captured; authoring lease closed; verification run enqueued |
+| `work` | Turn consumed with `input_needed` | `input` | Handoff `question` opened; authoring lease closed |
+| `work` | Turn consumed with `blocked`, or controller records a context-limit or step-limit blocker | `blocked` | Handoff `blocker` opened with reason; authoring lease closed |
+| `verification` | Integration cannot apply the source candidate | `work` | Conflict observation appended; handoff resolved; wake |
+| `verification` | Evidence fails the required profile | `work` | Diagnostic observation appended; handoff resolved; wake |
+| `verification` | Verification run fails for infrastructure reasons past its retry limit | `blocked` | Handoff `blocker` with reason `verification_unavailable` |
+| `verification` | Evidence satisfies the required profile | `review` | Handoff stays open; evidence linked |
+| `review` | Acceptance recorded; finish condition is review-only | `complete` | Handoff resolved |
+| `review` | Acceptance recorded; finish condition is publication | `publication` | Publication authorization and External operation registered; dispatch enqueued |
+| `review` | Reviewer requests changes | `work` | Instruction `redirect` recorded; revision; wake |
+| `publication` | Receipt joins current acceptance | `complete` | Handoff resolved |
+| `publication` | Destination revision no longer matches | `verification` | New integration candidate constructed; verification run enqueued |
+| `publication` | Operation `outcome_unknown` cannot be reconciled, or authority revoked | `blocked` | Handoff `blocker` with reason `publication_unresolved` |
+| `input` | Instruction `answer` recorded | `work` | Handoff resolved; answer appended as an observation; wake |
+| `blocked` | User resolves the blocker | `work` | Handoff resolved; resolution appended as an observation; wake; revision if the resolution changes instructions or environment |
+| any except `complete` | Instruction `redirect` recorded | `work` | Revision; open handoff resolved as superseded; in-flight verification or integration run cancellation requested; wake |
+| any | Requested state becomes `cancelled` | unchanged | Authoring and publication authority revoked; no further rows apply except reconciliation of existing operations |
 
-Durable wake requests may be delivered more than once. Their request identifiers and the lease-grant transaction prevent duplicate authorized attempts. A question or candidate handoff changes workflow phase, so an idle task does not immediately restart authoring just because it remains active.
+Requested state gates who may drive a row. Worker-driven rows (the three `work` exits) require requested state `active`, because the worker’s controller operations carry that precondition; under pause the drain permit may commit a paired observation but not consume the turn. Rows driven by a verification or integration callback, an instruction, or admission commit while `paused`, but the Wake request they open is `ineligible` for claiming and no publication dispatch is authorized until requested state returns to `active`. Resuming re-evaluates every pending wake. A `note` instruction changes no phase; it is appended as an observation before the next model request.
+
+Grant an authoring lease only by claiming a pending Wake request whose task is `active`, whose phase is `work`, whose revision is current, when no unexpired authoring lease exists, and when sufficient spending has been reserved. Increment the Task’s current epoch and create the Attempt in the same transaction. Renewals check the same authority using the database’s time. An eligibility scan runs on a fixed interval and creates a Wake request for any task that is `active`, in `work`, has no unexpired lease, and has no pending wake, so a lost wake delivery delays authoring by at most one interval.
+
+A lease is temporary permission to advance authoritative state. It does not physically stop a process. Correctness comes from the epoch check on every continuation commit, handoff, and dispatch authorization. Liveness comes from the control application, not the worker: when a lease expires without renewal, the control application marks the Attempt `lost` and instructs the execution backend directly to terminate or isolate that sandbox. It waits for the backend’s confirmation before reusing the workspace. If confirmation cannot be obtained within the run profile’s bound, the replacement receives a different workspace and the old one is quarantined.
+
+Durable wake requests may be delivered more than once. Their identifiers and the lease-grant transaction prevent duplicate authorized attempts. A handoff changes workflow phase, so an idle task does not restart authoring just because it remains active.
 
 **Run one small, explicit agent loop.**
 
@@ -106,7 +167,11 @@ The initial tool is `command`. It accepts a command string and a working directo
 
 Validate tool names and argument structure at the model-adapter boundary. Treat every command as potentially changing local state. Run commands serially. Keep process supervision, lease checks, and stop handling responsive while a model request or command is in progress.
 
-Stop all command descendants before acknowledging its result and snapshot. Do not permit unmanaged background processes. Network access is restricted to supported read access and controlled dependency sources; external mutation credentials remain with the gateway. The model adapter does not enable hosted tools that execute outside these controls.
+Stop all command descendants before acknowledging its result and snapshot. Do not permit unmanaged background processes. This removes the start-a-server-then-probe-it workflow across commands; the initial release accepts that cost and tells the model, in every request, that a service must be started, exercised, and stopped within one command. Task success rate under this rule is one of the workload measurements.
+
+All sandbox egress passes through a supervisor-owned proxy that holds no task credentials. The run profile names an allowlist of destination hosts and path prefixes; the proxy refuses everything else, follows no redirects off the allowlist, and records every request line as an observation artifact. “Read access” means an allowlisted destination whose contract the operator has classified as non-mutating; the HTTP verb is not the classification. External mutation credentials remain with the gateway. Because an allowlisted destination can still receive encoded data in a request, workspace secret exfiltration is bounded, not prevented: admission scans the repository for known credential patterns and warns, and the proxy log is part of the review record. The model adapter does not enable hosted tools that execute outside these controls.
+
+Each model request is registered before it is sent. The Model request record carries a controller request ID, the request slot, the current revision and epoch, a provider idempotency key derived from the request ID, and the reservation for that generation. A worker that dies after sending leaves the record in `sent`. Recovery moves it to `accepted` only if the provider supports lookup by idempotency key and returns the complete response; otherwise it becomes `outcome_unknown`, its reservation is retained until settlement, and the replacement opens a new slot. Follow-up requests to a stateful backend always continue from the last accepted turn’s continuation metadata, so an abandoned server-side branch is never referenced again.
 
 Model responses can contain tool calls or a structured proposal: `candidate_ready`, `input_needed`, or `blocked`. A proposal includes a short explanation. It does not accept the task or establish that its checks passed.
 
@@ -117,8 +182,9 @@ while controller.permits_this_authoring_attempt():
     turn = load_pending_turn(state)
     if turn is absent:
         input = compose_model_input(state, controller.current_task())
-        response = model.generate_complete_response(input)
-        state, turn = controller.accept_response_once(response, state)
+        request = controller.register_model_request(state)
+        response = model.generate_complete_response(input, request.idempotency_key)
+        state, turn = controller.accept_response_once(request, response, state)
 
     for call in turn.remaining_calls:
         if call is invalid or unsupported:
@@ -142,7 +208,20 @@ while controller.permits_this_authoring_attempt():
 return supervisor.stop_and_report()
 ```
 
-This is structural pseudocode. Each controller operation independently validates current authority. Failed persistence, lost acknowledgments, and control changes stop the ordinary path and use the recovery rules below. The loop’s first check alone is insufficient authorization.
+This is structural pseudocode. Each controller operation is one conditional transaction whose precondition includes the current task revision, the caller’s epoch, and requested state `active`. The table below is their contract. Failed persistence, lost acknowledgments, and control changes stop the ordinary path and use the recovery rules below. The loop’s first check alone is insufficient authorization.
+
+| Operation | Reads | Writes | Idempotency key |
+|---|---|---|---|
+| `restore_authoritative_continuation` | Task current continuation, Continuation, Checkpoint, pending Accepted turn and its Calls | Observation of kind `restored` | Attempt epoch (one restore observation per attempt) |
+| `permits_this_authoring_attempt` | Task requested state, phase, revision, epoch; Attempt lease expiry; run-profile step count | Lease renewal | — |
+| `load_pending_turn` | Continuation pending accepted turn; Accepted turn; Calls | — | — |
+| `register_model_request` | Continuation, Spending entry | Model request `registered`; reservation | Controller request ID (one open request per slot) |
+| `accept_response_once` | Model request, Continuation | Model request `accepted`; Accepted turn; Calls `accepted`; Continuation pending turn | Request slot (second acceptance fails) |
+| `commit_call_error` | Call | Call `error`; Observation; Continuation next call index | Call ID |
+| `authorize_current_call` | Task, Attempt, Call, run profile | Call `not_executed: denied` on refusal | Call ID |
+| `confirm_call_intent` | Call `accepted` | Call `confirmed`; execution try | Call ID and try number |
+| `commit_observation_and_files` | Call `confirmed` or `executing`; expected prior Continuation | Observation; Checkpoint reference; Call `observed`; new Continuation; Task current continuation | Expected prior continuation version |
+| `consume_turn_once` | Accepted turn `pending`; all Calls terminal | Accepted turn `consumed`; Continuation pending turn cleared; next request slot or Handoff; Task phase per the transition table | Turn ID (returns the existing Handoff on retry) |
 
 **Consume each model decision once.**
 
@@ -162,13 +241,13 @@ A nonzero exit is an observation, not a storage failure. Commit its actual outpu
 
 If a persistence response is lost, query its stable identity before proceeding. If the controller cannot establish the outcome, stop at that boundary. Never infer from a timeout that the commit failed.
 
-The initial recovery contract covers repository files, durable task history, and observations. Temporary process state is discarded. Every command ends in a continuation commit; less frequent checkpointing is a later optimization that must preserve the same recovery invariant.
+The initial recovery contract covers repository files, durable task history, and observations. Temporary process state is discarded. Every command result the model sees as completed was committed in a paired continuation; a command that was interrupted, cancelled, crashed, or ran out its drain window ends without advancing the continuation and is represented by an `interrupted` call status and observation. Less frequent checkpointing is a later optimization that must preserve the same pairing.
 
 Pin the base environment by immutable identity. System tools and configuration in that base are read-only to task commands. The workspace is the only durable writable root in the initial release; its checkpoint includes dependency files and configuration even when Git ignores them. Install project dependencies there. Other permitted writable directories are declared disposable scratch space. Changing system tools requires selecting a new prepared environment in a new task revision. Record the environment change for the next attempt and rebuild affected dependencies before relying on them.
 
 On replacement, restore the pinned base and the workspace checkpoint. Before the next model request, append a controller observation naming the restored continuation and stating that scratch files and processes were discarded. The recovery snapshot and the submitted source candidate have separate manifests: recoverable dependency files need not be proposed source changes.
 
-On failure, stop or isolate the old execution boundary and restore the latest acknowledged continuation. An interrupted command can be replayed only when its changes were confined to recoverable repository state or disposable sandbox state. Record another execution try and use its actual result. Untracked persistent or remote changes make the outcome uncertain and block dependent work.
+On failure, stop or isolate the old execution boundary and restore the latest acknowledged continuation. The initial release never replays an interrupted command automatically. No component can establish from a shell command string whether its effects were confined to the workspace, and an allowlisted read destination is still a remote party. The interrupted call receives status `interrupted` and an observation stating what is known: the command, how long it ran, any captured output, and that its filesystem effects were discarded with the workspace restored to the prior continuation. The model decides whether to reissue it as a new call. Automatic replay for a declared effect class is a later addition that requires the proxy to attest no external request was made during the interrupted try.
 
 If a committed checkpoint is missing or corrupt, recovery fails visibly. Choosing an older continuation requires an explicit recovery decision that reports lost progress and preserves external-operation records. Never place a newer conversation over older files.
 
@@ -180,7 +259,9 @@ Pause prevents new model calls, command dispatches, authoring lease grants, term
 
 Cancellation immediately revokes new authoring and mutation authority. The supervisor cancels model requests and stops commands. The interface reports stopping until termination or isolation is confirmed, and continuing billable compute remains visible. Recovery guarantees only the last acknowledged continuation. A previously authorized external dispatch may still reach its destination or finish and remains subject to reconciliation.
 
-Redirection creates a new task revision and invalidates pending decisions from the old one. Undispatched calls receive `not_executed: superseded` observations. An interrupted local call gets an honest interruption record after its uncommitted changes are discarded or deliberately paired and saved through an authorized transition. Preserve committed results and their matching files. Begin the revised job from a coherent continuation and a new request slot. Do not resume work while requested state is paused or cancelled.
+A user message is recorded as an Instruction of one kind, and the kind determines its effect. An `answer` resolves an open `question` handoff and returns the task to `work` without a revision. A `note` is appended as an observation before the next model request and changes nothing else; it is the default kind while the task is in `work`. A `redirect` creates a new task revision; it is the only kind permitted while the task is in `verification`, `review`, or `publication`, because a message there necessarily changes what is being judged. The interface shows the kind it will record and lets the user change it before sending.
+
+Redirection is one transaction: it creates the new revision, sets phase `work`, resolves any open handoff as superseded, marks the old candidate’s evidence and acceptance as retained but inapplicable, requests cancellation of any in-flight verification or integration run while keeping that run’s reservation until settlement, and opens a Wake request. Undispatched calls receive `not_executed: superseded`. An interrupted local call gets an `interrupted` record after its uncommitted changes are discarded or deliberately paired and saved through an authorized drain permit. Preserve committed results and their matching files. Begin the revised job from a coherent continuation and a new request slot. Do not resume work while requested state is paused or cancelled.
 
 The model adapter accounts for every accepted call when preparing a follow-up request. Outstanding external uncertainty remains visible across all these transitions.
 
@@ -188,29 +269,31 @@ The model adapter accounts for every accepted call when preparing a follow-up re
 
 Every request includes the current task, finish conditions, limits, workspace description, tool definitions, and relevant committed observations. Repository text and command output are data. They cannot change permissions, task revision, or completion criteria.
 
-Retain full visible history in durable storage. When it no longer fits, summarize older completed turns into a short memo that names its source range. Keep current instructions, unresolved work, and operation receipts separately and exactly. A model-written memo is a fallible navigation aid and cannot establish permissions, verification, or completed actions. Recovery does not depend on access to private model reasoning.
+Retain full visible history in durable storage. When it no longer fits, summarize older completed turns into a short memo that names its source range. A model-written memo is a fallible navigation aid and cannot establish permissions, verification, or completed actions. Every request also carries a controller-rendered fact block that the memo cannot displace: the current instructions verbatim, the list of files changed since the task’s base revision computed from the current checkpoint manifest, every open handoff and unresolved external operation with its receipt state, and the restored-continuation observation if this attempt restored. The fact block is placed after the memo so that a memo contradicting it is visibly contradicted. Recovery does not depend on access to private model reasoning.
 
 Store large output as bounded task artifacts and provide useful excerpts. Approved read-only copies can be made available to commands for inspection. Apply task access controls to prompts, files, and logs. Keep known credentials out of collection paths; arbitrary output cannot be assumed safe because a text filter ran.
 
-If mandatory instructions and unresolved state cannot fit, yield a context-limit blocker. Bound model requests, command duration, corrective retries, execution steps, output storage, and spending through an explicit run profile.
+If mandatory instructions and the fact block cannot fit, the controller records a Handoff of kind `blocker` with reason `context_limit` and the task enters the `blocked` phase. Bound model requests, command duration, corrective retries, execution steps, output storage, and spending through an explicit run profile; exhausting the step limit is a blocker with reason `step_limit`.
 
 **A proposed result enters a separate completion path.**
 
-The terminal-turn transaction captures a candidate from committed state, records the handoff, changes workflow phase, and closes authoring authority. The supervisor stops the worker. Verification and integration use their own constrained controller authority.
+The terminal-turn transaction captures a source candidate from committed state, records the handoff, changes workflow phase, and closes authoring authority. The supervisor stops the worker. Verification and integration use their own constrained controller authority.
 
-For a review-only task, verify the proposed candidate directly. For a publication task, first construct the exact integration candidate against the current destination revision. If integration cannot resolve the changes, record the conflict and deliberately return the task to work with those diagnostics.
+For a review-only task, verify the source candidate directly. For a publication task, first construct the exact integration candidate against the current destination revision. If integration cannot resolve the changes, record the conflict and return the task to `work` through the transition table with those diagnostics.
 
 Run required checks on the resulting immutable candidate. Only the verification controller may publish evidence that satisfies those checks. It records the candidate, approved profile, environment, and observations through a channel outside the candidate’s authority. The authoring harness’s logs remain useful supporting material but cannot impersonate verification evidence.
 
+Verification resolves dependencies from an immutable closure, never from a floating resolution. The required profile declares which: either the candidate must contain a lockfile with integrity hashes and the verification environment installs from it against the pinned dependency mirror, or the authoring checkpoint’s dependency directories are attached as a read-only verification input identified by hash. The candidate and the evidence each record the dependency-closure hash they used. When the two differ, the evidence carries a `dependency_drift` flag and the review view shows it; a profile that forbids drift fails the check. Network access during verification is limited to the pinned mirror.
+
 Keep the required test harness and reporting channel outside the candidate’s writable namespace. Tests written by the task can add evidence but cannot silently replace approved checks. Record relevant external inputs and any limits on reproducibility.
 
-Successful verification moves the task to review. A failed check records diagnostics and deliberately returns it to work, subject to requested state and remaining budget. An answered question likewise creates an explicit runnable transition and a new request slot.
+Successful verification moves the task to `review`. A failed check records diagnostics and returns it to `work` through the transition table, which opens the Wake request; the wake is claimable only while requested state is active and budget remains. An `answer` instruction follows its own row and likewise opens a wake and a new request slot.
 
-Verification and integration callbacks change phase only through an idempotent conditional transaction matching the current task revision, active handoff and candidate, expected phase, and authorized run identity. Stale or duplicate callbacks may retain their evidence but cannot redirect the current task. A callback received while paused may record its observation; authoring and publication remain blocked by requested state.
+Verification and integration callbacks change phase only through an idempotent conditional transaction matching the current task revision, active handoff and candidate, expected phase, and authorized run identity. Stale or duplicate callbacks may retain their evidence but cannot redirect the current task. A callback received while paused commits its transition-table row; the wake it opens stays ineligible and no publication dispatch is authorized until requested state returns to `active`.
 
 Review acceptance is a conditional decision about exact candidate contents under the current task revision and verification profile. A stale review screen cannot accept a revised task. The initial release carries no approval automatically onto changed integration contents: a new candidate requires applicable checks and review again.
 
-For publication, a separate authorization names the accepted candidate, destination, and expected destination revision. A publication receipt records what the destination actually accepted. Completion conditionally joins the current acceptance with the required receipt. Review-only completion needs no publication receipt. An unresolved operation required by the finish condition blocks completion.
+For publication, a separate authorization names the accepted integration candidate, destination, and expected destination revision. A publication receipt records what the destination actually accepted. Completion conditionally joins the current acceptance with the required receipt. Review-only completion needs no publication receipt. An operation in `outcome_unknown` that the finish condition requires prevents completion until reconciliation resolves it; if reconciliation cannot resolve it, the task enters `blocked` with reason `publication_unresolved`.
 
 Completion makes authoring wakes ineligible. It does not erase outstanding accounting or reconciliation obligations.
 
@@ -265,11 +348,13 @@ The repository connector must provide conditional destination updates and a docu
 
 A run profile specifies finite lease and drain durations, model and command limits, correction and step limits, output and storage limits, spending policy, and required verification profile. Retention configuration names the treatment of histories, checkpoints, accepted artifacts, audit records, credentials, and backups. Admission rejects missing required capabilities or limits. Vendor selection and numerical tuning do not change the invariants.
 
-Deletion first marks the task unavailable for new work, revokes authority, and blocks late uploads and wakeups. Retention workers then remove the promised records and unreferenced artifacts. Already published commits and external service records remain governed by their own owners; task deletion does not claim to retract them.
+Deletion first writes a tombstone on the task: it becomes unavailable for new work, authority is revoked, and late uploads and wakes are refused. Retention workers then remove the promised records and unreferenced artifacts, except that Spending entries with unsettled reservations, the budget account they reference, and External operations not yet in `succeeded` or `failed` are preserved until settlement or reconciliation completes. Already published commits and external service records remain governed by their own owners; task deletion does not claim to retract them.
 
 **Keep the first implementation easy to trace.**
 
 Use a main loop module, a model adapter, a supervisor/runner, a context builder, and a controller client where these responsibilities need separation. Avoid pass-through layers and a generic workflow language. Keep state definitions and transitions together in the control application.
+
+The component table above maps onto modules as follows. The control application is one deployable holding the scheduler, the verification controller, the integration module, and the action gateway as modules; the controller client is the harness’s interface to it. The harness and supervisor are one trusted worker process containing the main loop, model adapter, context builder, supervisor/runner, and egress proxy. The sandbox is a backend-provided isolated workspace the supervisor drives through the backend’s API. Verification runs in a separate fresh sandbox driven by the verification controller. Increment 1 delivers the worker process and the control application’s task, attempt, continuation, model request, turn, call, and observation records; later increments add the remaining modules.
 
 The chosen design combines the continuity of a persistent workspace with explicit recovery. A machine-per-task design offers simpler initial interaction but makes recovery depend more heavily on machine state. Fully stateless workers make bounded jobs easier to replace but require exploratory work to reconstruct its environment repeatedly. The hybrid’s extra bookkeeping is justified only if the validation and workload measurements support it.
 
@@ -277,10 +362,12 @@ The chosen design combines the continuity of a persistent workspace with explici
 
 | Increment | Deliverable | Exit condition |
 |---|---|---|
-| 1. Useful authoring | Durable task records; one model; one command tool; isolated execution; explicit yields and limits | Complete a small repository task, reject malformed calls, and stop a long command through the real supervisor |
-| 2. Recoverable work | Paired continuations, stable turns and calls, revision handling, and stop/resume | Restore correctly after failures around every acknowledgment boundary; stale workers cannot advance state |
-| 3. Verified results | Immutable candidates, controller-owned evidence, review, questions, and handoffs | Saying done cannot accept work; changed instructions and fabricated worker reports cannot satisfy required checks |
-| 4. Controlled publication | Integration queue, exact acceptance, durable operations, budget settlement, and destination receipts | Conflicting destination changes and lost external responses produce no silent overwrite or blind duplicate mutation |
+| 1. Useful authoring | Durable task, attempt, continuation, model request, turn, call, and observation records; paired continuation commit after every command; one model; one command tool; isolated execution with egress proxy; explicit yields and limits | Complete a small repository task from a scripted transcript with byte-identical final workspace; reject each malformed-call fixture with an `error` call and no process start; stop a long command through the real supervisor within the profile bound. Increment 1 makes no resume claim to users; the task view says so. |
+| 2. Recoverable work | Wake outbox and eligibility scan, lease and epoch fencing, stable turns and calls, revision handling, instruction kinds, stop/resume, backend termination | For each row of the acknowledgment-boundary list below, kill the worker at pre-commit, post-commit/pre-response, and post-response; a replacement restores the exact manifest hash, cursor, and call states and finishes the scripted task. A worker with a stale epoch fails every commit attempt. |
+| 3. Verified results | Source and integration candidates, controller-owned evidence, dependency-closure recording, review, questions, blockers, handoffs | A `candidate_ready` proposal with failing checks returns to `work` with a wake; worker-uploaded evidence is rejected by the verification controller; a redirect during `review` invalidates acceptance in one transaction; drift between authoring and verification closures is flagged. |
+| 4. Controlled publication | Integration queue, exact acceptance, durable operations, budget settlement, destination receipts, deletion tombstones | A destination change between verification and dispatch fails the compare-and-swap and produces a new integration candidate; a lost response after a successful destination write reconciles to `succeeded` with no second write; deletion during a billable execution preserves the reservation until settlement. |
+
+The acknowledgment boundaries for Increment 2 fault injection are: `register_model_request`, provider send, `accept_response_once`, `confirm_call_intent`, command start, command exit, object upload, `commit_observation_and_files`, `consume_turn_once`, wake creation, and lease grant. Each has an idempotency key in the operation table above; the test asserts that the recovery query on that key yields one durable state.
 
 The initial release is complete only when all four increments meet their exit conditions. Use scripted model responses to inject exact failures, then exercise the same harness and sandbox with a real model. Scripted responses alone do not prove process isolation, provider behavior, or durable storage.
 
@@ -293,7 +380,9 @@ The initial release is complete only when all four increments meet their exit co
 | Duplicate complete response | Only one accepted response and batch for its request slot |
 | Empty response or unsupported tool | Explicit error and bounded correction; no accidental dispatch or endless pending turn |
 | Crash before a call-intent acknowledgment | No command starts until registration is confirmed |
-| Crash after a local edit but before continuation commit | Restore the earlier matching history and files; retain an honest interruption record |
+| Crash after a local edit but before continuation commit | Restore the earlier matching history and files; the call is `interrupted` and is not replayed automatically |
+| Crash after the provider accepted a model request but before the controller accepted the response | Model request ends in `accepted` via provider lookup or `outcome_unknown`; its reservation is retained; at most one Accepted turn exists for the slot; the replacement continues from the last accepted turn |
+| Interrupted command may have reached an allowlisted destination | Not replayed; `interrupted` observation names the command and proxy-logged requests; the model decides |
 | Observation upload without checkpoint commit | Provisional output cannot enter active context as completed work |
 | Committed continuation followed by worker loss | Restore its exact files before exposing its observations |
 | Out-of-order snapshot uploads | The current continuation cannot move backward |
@@ -302,11 +391,20 @@ The initial release is complete only when all four increments meet their exit co
 | Cancellation or redirection during generation | Old decisions cannot dispatch or produce a current-revision handoff |
 | Crash after recording a question or candidate | Return the same handoff; do not create another |
 | Handoff while task remains active | No authoring lease is granted outside the work phase |
+| Task is `active` in `work` with no lease and its wake was never delivered | The eligibility scan creates a wake within one interval; authoring resumes |
+| Crash between a phase change to `work` and its wake creation | Impossible by construction: both are one transaction; the test asserts no committed `work` phase without a pending or claimed wake |
+| Lease expires while the worker is partitioned, not dead | Control application marks the attempt `lost`, terminates via the backend API, and confirms before workspace reuse; the partitioned worker’s later commits fail on epoch |
 | Delayed verification or integration callback belongs to an older candidate | Keep its evidence without changing the current phase |
 | Old processes remain in a suspended workspace | Do not assign that writable workspace to the replacement |
 | Replacement worker restores a task with installed dependencies | Restore dependencies from the saved workspace and report discarded scratch state; the base environment remains pinned |
-| Referenced checkpoint is missing or corrupt | Visible recovery failure; no mismatched older-files/newer-history fallback |
+| Repository contains a symlink, hard link, or path that escapes the workspace | Snapshot records the symlink target without following it, rejects the escaping path, and restore writes nothing outside the fresh workspace root |
+| Referenced checkpoint is missing or corrupt | Fault outside the storage durability contract; visible recovery failure; no mismatched older-files/newer-history fallback |
 | Worker uploads fabricated passing evidence | It cannot satisfy the required verification profile |
+| Authoring dependency closure differs from the verification closure | Evidence carries `dependency_drift`; review shows it; a profile forbidding drift fails |
+| Summary memo contradicts the checkpoint or unresolved-work records | The controller fact block in the same request states the committed truth; the memo cannot remove a handoff, receipt, or changed file from model input |
+| Prompt-injected command attempts to send workspace secrets to a non-allowlisted host | The proxy refuses the request and records the attempt as an observation |
+| User sends a message during `review` | Recorded as `redirect`; new revision, phase `work`, acceptance and evidence retained but inapplicable, in-flight run cancellation requested with reservation kept, wake created, all in one transaction |
+| User sends a message during `work` | Recorded as `note`; no phase or revision change; appended before the next model request |
 | Candidate, task revision, or required profile changes during review | Stale acceptance fails its conditional transaction |
 | Destination changes after candidate verification | Conditional publication fails; new integration result gets checked and reviewed |
 | External mutation succeeds but its response is lost | Reconcile the registered operation; no blind retry |
@@ -314,8 +412,9 @@ The initial release is complete only when all four increments meet their exit co
 | Pause races publication authorization | Ordering in the control database determines whether a dispatch was already authorized; no later authorization proceeds |
 | Worker, model request, or verification run remains billable after replacement | Its reservation remains; replacement spending requires another reservation |
 | Deletion races a wake, upload, or publication | New authority is blocked; retained external obligations remain visible under retention policy |
+| Deletion while a worker, model request, or verification run is still billable | Tombstone written; the Spending entry, its budget account, and any unresolved External operation survive retention until settled or reconciled |
 | Reviewer opens a task whose worker is unavailable | Saved goal, changes, evidence, spending, and next decision remain accessible |
 
 Operational logs carry task revision, attempt epoch, turn and call IDs, continuation identity, candidate identity, and external-operation identity where applicable. Use these to reconstruct a failure without reading an entire conversation.
 
-Measure restore success, lost uncommitted work, checkpoint overhead, restore latency, storage consumption, accepted-task cost, uncertain or duplicated external outcomes, and review delay on a fixed repository workload. Establish numerical release thresholds before running that workload. Claims about improved speed, cost, reliability, or reviewer effort require those measurements.
+Measure restore success, lost uncommitted work, checkpoint overhead per command on the workload’s largest workspace, restore latency, storage consumption, accepted-task cost, task success rate under the one-command service rule, uncertain or duplicated external outcomes, and review delay on a fixed repository workload. Establish numerical release thresholds before running that workload. Claims about improved speed, cost, reliability, or reviewer effort require those measurements.
